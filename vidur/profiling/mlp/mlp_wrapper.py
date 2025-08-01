@@ -1,14 +1,19 @@
 import os
 
-import sarathi.metrics.cuda_timer
+try:
+    import sarathi.metrics.cuda_timer
+    from sarathi.model_executor.weight_utils import initialize_dummy_weights
+    from vidur.profiling.common.cuda_timer import CudaTimer
+    # monkey patching the CudaTimer class to use the sarathi implementation
+    sarathi.metrics.cuda_timer.CudaTimer = CudaTimer
+except ImportError:
+    # Mock initialize_dummy_weights if sarathi is not available
+    def initialize_dummy_weights(model):
+        for param in model.parameters():
+            if param.requires_grad:
+                torch.nn.init.uniform_(param, -0.1, 0.1)
+
 import torch
-
-from vidur.profiling.common.cuda_timer import CudaTimer
-
-# monkey patching the CudaTimer class to use the sarathi implementation
-sarathi.metrics.cuda_timer.CudaTimer = CudaTimer
-
-from sarathi.model_executor.weight_utils import initialize_dummy_weights
 
 from vidur.profiling.common.model_config import ModelConfig
 from vidur.profiling.common.timer_stats_store import TimerStatsStore

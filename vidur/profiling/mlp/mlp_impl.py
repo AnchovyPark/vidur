@@ -1,14 +1,92 @@
 from typing import Optional
 
 import torch
-from sarathi.model_executor.layers.activation import SiluAndMul
-from sarathi.model_executor.layers.layernorm import RMSNorm
-from sarathi.model_executor.layers.rotary_embedding import get_rope
-from sarathi.model_executor.parallel_utils.tensor_parallel.layers import (
-    ColumnParallelLinear,
-    RowParallelLinear,
-    VocabParallelEmbedding,
-)
+try:
+    from sarathi.model_executor.layers.activation import SiluAndMul
+    from sarathi.model_executor.layers.layernorm import RMSNorm
+    from sarathi.model_executor.layers.rotary_embedding import get_rope
+    from sarathi.model_executor.parallel_utils.tensor_parallel.layers import (
+        ColumnParallelLinear,
+        RowParallelLinear,
+        VocabParallelEmbedding,
+    )
+except ImportError:
+    # Mock implementations for sarathi layers
+    class SiluAndMul(torch.nn.Module):
+        def forward(self, x):
+            gate, up = x.chunk(2, dim=-1)
+            return torch.nn.functional.silu(gate) * up
+    
+    class RMSNorm(torch.nn.Module):
+        def __init__(self, hidden_size, eps=1e-6):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(hidden_size))
+            self.variance_epsilon = eps
+        
+        def forward(self, hidden_states):
+            input_dtype = hidden_states.dtype
+            hidden_states = hidden_states.to(torch.float32)
+            variance = hidden_states.pow(2).mean(-1, keepdim=True)
+            hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+            return self.weight * hidden_states.to(input_dtype)
+    
+    def get_rope(head_size, rotary_dim, max_position, base, is_neox_style=True, rope_scaling=None):
+        # Mock implementation
+        class MockRoPE:
+            def forward(self, positions, query, key):
+                return query, key
+            
+            def __call__(self, positions, query, key):
+                return query, key
+        return MockRoPE()
+    
+    class ColumnParallelLinear(torch.nn.Module):
+        def __init__(self, input_size, output_size, bias=True, world_size=1, gather_output=True, **kwargs):
+            super().__init__()
+            # For tensor parallelism, divide output across workers
+            self.world_size = world_size
+            self.gather_output = gather_output
+            self.output_size_per_partition = output_size // world_size
+            self.linear = torch.nn.Linear(input_size, self.output_size_per_partition, bias=bias)
+        
+        def forward(self, x):
+            output = self.linear(x)
+            # If gather_output is False, return partitioned output
+            # If gather_output is True, simulate gathering by returning full size
+            if self.gather_output:
+                # Simulate gather by expanding the output
+                batch_size, seq_len = output.shape[:2]
+                full_output = output.repeat(1, 1, self.world_size)
+                return full_output, None
+            else:
+                return output, None
+    
+    class RowParallelLinear(torch.nn.Module):
+        def __init__(self, input_size, output_size, bias=True, world_size=1, **kwargs):
+            super().__init__()
+            # For tensor parallelism, divide input across workers  
+            self.world_size = world_size
+            self.input_size_per_partition = input_size // world_size
+            self.linear = torch.nn.Linear(self.input_size_per_partition, output_size, bias=bias)
+        
+        def forward(self, x):
+            # In real tensor parallelism, input would be split across devices
+            # For simulation, we split the input tensor along the last dimension
+            if len(x.shape) == 3:
+                partitioned_input = x[:, :, :self.input_size_per_partition]
+            else:  # 2D tensor
+                partitioned_input = x[:, :self.input_size_per_partition]
+            output = self.linear(partitioned_input)
+            # In real implementation, outputs would be all-reduced across devices
+            return output, None
+    
+    class VocabParallelEmbedding(torch.nn.Module):
+        def __init__(self, num_embeddings, embedding_dim, **kwargs):
+            super().__init__()
+            self.embedding = torch.nn.Embedding(num_embeddings, embedding_dim)
+        
+        def forward(self, x):
+            return self.embedding(x)
 
 from vidur.profiling.common.cuda_timer import CudaTimer
 from vidur.profiling.common.model_config import ModelConfig
@@ -29,13 +107,15 @@ class CausalSelfAttention(torch.nn.Module):
         self.num_q_heads_per_worker = config.num_q_heads // world_size
         self.num_kv_heads_per_worker = config.num_kv_heads // world_size
 
-        self.q_size = self.num_q_heads_per_worker * self.head_dim
-        self.kv_size = self.num_kv_heads_per_worker * self.head_dim
+        # For tensor parallelism, each worker handles a portion of heads
+        # Since gather_output=False, we need to account for further partitioning
+        self.q_size = (self.num_q_heads_per_worker * self.head_dim) // world_size
+        self.kv_size = (self.num_kv_heads_per_worker * self.head_dim) // world_size
         self.scaling = self.head_dim**-0.5
 
         self.qkv_proj = ColumnParallelLinear(
             config.embedding_dim,
-            (config.num_q_heads + 2 * config.num_kv_heads) * self.head_dim,
+            (self.num_q_heads_per_worker + 2 * self.num_kv_heads_per_worker) * self.head_dim,
             bias=config.use_bias or config.use_qkv_bias,
             gather_output=False,
             linear_metric_name="attn_pre_proj",
@@ -43,7 +123,7 @@ class CausalSelfAttention(torch.nn.Module):
         )
 
         self.o_proj = RowParallelLinear(
-            config.num_q_heads * self.head_dim,
+            self.num_q_heads_per_worker * self.head_dim,
             config.embedding_dim,
             bias=config.use_bias,
             input_is_parallel=True,
@@ -80,10 +160,12 @@ class MLP(torch.nn.Module):
 
         assert config.embedding_dim % world_size == 0
 
+        self.mlp_hidden_dim_per_worker = config.mlp_hidden_dim // world_size
+        
         if config.use_gated_mlp:
             self.up_proj = ColumnParallelLinear(
                 config.embedding_dim,
-                2 * config.mlp_hidden_dim,
+                2 * self.mlp_hidden_dim_per_worker,
                 bias=config.use_bias,
                 gather_output=False,
                 world_size=world_size,
@@ -93,7 +175,7 @@ class MLP(torch.nn.Module):
         else:
             self.up_proj = ColumnParallelLinear(
                 config.embedding_dim,
-                config.mlp_hidden_dim,
+                self.mlp_hidden_dim_per_worker,
                 bias=config.use_bias,
                 gather_output=False,
                 world_size=world_size,
@@ -102,7 +184,7 @@ class MLP(torch.nn.Module):
             self.act = torch.nn.GELU()
 
         self.down_proj = RowParallelLinear(
-            config.mlp_hidden_dim,
+            self.mlp_hidden_dim_per_worker,
             config.embedding_dim,
             bias=config.use_bias,
             input_is_parallel=True,

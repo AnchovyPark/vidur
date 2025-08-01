@@ -32,22 +32,21 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="profiling_outputs",
+        default="/home/ubuntu/vidur/data/profiling/compute",
         help="Output directory for profiling results",
+    )
+    parser.add_argument(
+        "--gpu_type",
+        type=str,
+        default="T4",
+        help="GPU type for organizing results",
     )
     parser.add_argument(
         "--models",
         type=str,
         nargs="+",
         default=[
-            # "microsoft/phi-2",
-            # "internlm/internlm-20b",
-            # "Qwen/Qwen-72B",
-            # "meta-llama/Llama-2-7b-hf",
-            # "codellama/CodeLlama-34b-Instruct-hf",
-            # "meta-llama/Llama-2-70b-hf",
             "meta-llama/Meta-Llama-3-8B",
-            "meta-llama/Meta-Llama-3-70B",
         ],
         help="Models to profile",
     )
@@ -55,13 +54,13 @@ def parse_args():
         "--num_tensor_parallel_workers",
         type=int,
         nargs="+",
-        default=[1, 2, 4, 8],
+        default=[4, 8],
         help="Number of tensor parallel workers to profile",
     )
     parser.add_argument(
         "--max_seq_len",
         type=int,
-        default=256 * 1024,
+        default=8192,
         help="Maximum context length of input",
     )
     parser.add_argument(
@@ -73,7 +72,7 @@ def parse_args():
     parser.add_argument(
         "--max_batch_size",
         type=int,
-        default=128,
+        default=256,
         help="Maximum decode batch size",
     )
     parser.add_argument(
@@ -106,7 +105,8 @@ def parse_args():
     )
     args = parser.parse_args()
 
-    args.output_dir = f"{args.output_dir}/attention/{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+    # Create GPU-specific directory structure
+    args.output_dir = f"{args.output_dir}/{args.gpu_type}/attention/{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
     os.makedirs(args.output_dir, exist_ok=True)
 
     return args
@@ -219,25 +219,20 @@ def main():
     pbar = tqdm(total=sum(len(v) for v in total_combos.values()))
 
     for model in args.models:
-        result_df = pd.DataFrame()
         for num_tensor_parallel_workers in args.num_tensor_parallel_workers:
-            result_df = pd.concat(
-                [
-                    result_df,
-                    profile_model(
-                        args,
-                        model,
-                        num_tensor_parallel_workers,
-                        total_combos[(model, num_tensor_parallel_workers)],
-                        max_num_blocks_dict[(model, num_tensor_parallel_workers)],
-                        dtype,
-                        pbar,
-                    ),
-                ]
+            result_df = profile_model(
+                args,
+                model,
+                num_tensor_parallel_workers,
+                total_combos[(model, num_tensor_parallel_workers)],
+                max_num_blocks_dict[(model, num_tensor_parallel_workers)],
+                dtype,
+                pbar,
             )
-        # model name would contain '/', so create a directory as required
-        os.makedirs(f"{args.output_dir}/{model}", exist_ok=True)
-        result_df.to_csv(f"{args.output_dir}/{model}/attention.csv", index=False)
+            # Create directory structure: model/tp_workers/
+            model_dir = f"{args.output_dir}/{model}/tp_{num_tensor_parallel_workers}"
+            os.makedirs(model_dir, exist_ok=True)
+            result_df.to_csv(f"{model_dir}/attention.csv", index=False)
 
 
 if __name__ == "__main__":

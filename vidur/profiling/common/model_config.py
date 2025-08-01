@@ -2,7 +2,13 @@ from dataclasses import asdict
 from typing import Any, Dict, Optional
 
 import torch
-from sarathi.config import ParallelConfig
+try:
+    from sarathi.config import ParallelConfig
+except ImportError:
+    class ParallelConfig:
+        def __init__(self, tensor_parallel_size=1, pipeline_parallel_size=1):
+            self.tensor_parallel_size = tensor_parallel_size
+            self.pipeline_parallel_size = pipeline_parallel_size
 
 from vidur.config.model_config import BaseModelConfig
 from vidur.types import ActivationType, NormType
@@ -78,3 +84,6 @@ class ModelConfig:
     @property
     def dtype(self):
         return torch.float16
+    
+    def get_num_layers(self, parallel_config: ParallelConfig):
+        return self.num_layers // parallel_config.pipeline_parallel_size

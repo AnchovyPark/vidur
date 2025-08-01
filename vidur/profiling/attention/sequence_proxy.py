@@ -15,6 +15,9 @@ class SequenceProxy:
 
     def get_num_prompt_tokens_processed(self):
         return self._processed_len
+    
+    def get_num_prompt_tokens_stage_processed(self):
+        return self._processed_len
 
 
 class SequenceMetadataProxy:

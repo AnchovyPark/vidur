@@ -1,0 +1,10 @@
+disable_ray: true
+gpu_type: T4
+max_tokens: 8192
+models:
+- meta-llama/Meta-Llama-3-8B
+num_gpus: 8
+num_tensor_parallel_workers:
+- 4
+output_dir: /home/ubuntu/vidur/data/profiling/compute/T4/mlp
+profile_method: record_function
